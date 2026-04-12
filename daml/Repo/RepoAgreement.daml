@@ -1,0 +1,97 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Repo.RepoAgreement where
+
+import Daml.Script
+import DA.Date as Date
+import DA.Time as Time
+import DA.Math (intToDecimal)
+import Repo.Settlement (BilateralSettlement(..)) -- Assumes settlement logic is in another module
+
+-- | Defines the collateral asset involved in the repo transaction.
+-- Typically identified by a standard identifier like ISIN or CUSIP.
+data Collateral = Collateral
+  with
+    identifier : Text
+    quantity : Decimal
+  deriving (Eq, Show)
+
+-- | Represents the bilateral agreement for a repurchase transaction after Leg 1 (purchase)
+-- has completed and before Leg 2 (repurchase) is due.
+-- This contract captures the terms agreed upon by both parties and serves as the
+-- master record for the in-flight repo. The settlement of the repurchase leg is
+-- handled by exercising a choice on the associated `BilateralSettlement` contract.
+template RepoAgreement
+  with
+    tradeIdentifier : Text
+      -- ^ A unique identifier for the repo trade, used for tracking and auditing.
+    cashBorrower : Party
+      -- ^ The party who initially sells the collateral for cash (the repo seller).
+      -- This party is obligated to repurchase the collateral at maturity.
+    cashLender : Party
+      -- ^ The party who initially buys the collateral with cash (the repo buyer).
+      -- This party is obligated to sell the collateral back at maturity.
+    principal : Decimal
+      -- ^ The amount of cash exchanged at the start of the repo (Leg 1).
+    repoRate : Decimal
+      -- ^ The annualized interest rate for the repo, e.g., 0.05 for 5%.
+    collateral : Collateral
+      -- ^ The collateral provided by the cash borrower to the cash lender.
+    startDate : Date
+      -- ^ The effective date of the repo agreement (Leg 1 settlement date).
+    maturityDate : Date
+      -- ^ The date on which the repurchase (Leg 2) is due.
+    repurchaseSettlementCid : ContractId BilateralSettlement
+      -- ^ The contract ID of the DvP (Delivery vs. Payment) instruction for the
+      -- repurchase leg. Exercising this instruction atomically settles the repo.
+  where
+    signatory cashBorrower, cashLender
+
+    key (cashBorrower, cashLender, tradeIdentifier) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    ensure
+      principal > 0.0 &&
+      collateral.quantity > 0.0 &&
+      maturityDate > startDate &&
+      repoRate >= 0.0
+
+    -- | Calculates the total amount due at maturity, which is the principal plus
+    -- the interest accrued over the term of the repo.
+    -- This implementation uses a simple Actual/365 day count convention.
+    let calculateRepurchaseAmount : Decimal =
+          let
+            daysHeld : Int = Date.daysSinceEpoch maturityDate - Date.daysSinceEpoch startDate
+            yearFraction : Decimal = intToDecimal daysHeld / 365.0
+            interest : Decimal = principal * repoRate * yearFraction
+          in
+            principal + interest
+
+    -- | Allows the cash borrower to view the calculated repurchase amount before settlement.
+    nonconsuming choice GetRepurchaseAmount : Decimal
+      controller cashBorrower, cashLender
+      do return calculateRepurchaseAmount
+
+    -- | Executes the repurchase leg (Leg 2) of the repo transaction.
+    -- The `cashBorrower` initiates this choice on or after the maturity date.
+    -- It triggers the underlying DvP settlement instruction, which atomically
+    -- exchanges the repurchase amount for the collateral. Upon successful settlement,
+    -- this `RepoAgreement` contract is archived.
+    choice SettleRepurchase : ()
+      controller cashBorrower
+      do
+        now <- getTime
+        today <- fst <$> toDateUTC now
+        assertMsg "Repurchase can only be settled on or after the maturity date" (today >= maturityDate)
+
+        -- Exercise the settlement instruction to perform the atomic DvP.
+        -- This is a consuming choice on the BilateralSettlement contract.
+        -- If this exercise fails, the entire transaction is rolled back, and this
+        -- RepoAgreement contract remains active.
+        exercise repurchaseSettlementCid Settle with settlementAmount = calculateRepurchaseAmount
+
+        -- This choice is consuming (returns ()), so successful execution of the above
+        -- `exercise` will result in this RepoAgreement contract being archived in the
+        -- same atomic transaction.
+        pure ()
