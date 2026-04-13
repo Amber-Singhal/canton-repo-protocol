@@ -1,0 +1,96 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Repo.CollateralLeg where
+
+import Daml.Finance.Interface.Asset.Fungible qualified as F (I, V, Split(..), Transfer(..))
+import Daml.Finance.Interface.Asset.Fungible.Types (SplitResult(..))
+import DA.Set (singleton)
+import Repo.RepoAgreement (RepoAgreement)
+
+-- | Proposal for the collateral leg of a repo transaction.
+-- The `seller` proposes to deliver a specific quantity of a tokenized asset
+-- to the `buyer`. This proposal must be accepted by the `buyer` to become a
+-- bilateral agreement.
+template CollateralLegProposal
+  with
+    seller : Party
+      -- ^ The party delivering the collateral (borrower).
+    buyer : Party
+      -- ^ The party receiving the collateral (lender).
+    collateralAccount : F.V
+      -- ^ The fungible token account view specifying the collateral to be transferred.
+    repoAgreementCid : ContractId RepoAgreement
+      -- ^ A reference to the parent repo agreement, for context and traceability.
+    description : Text
+      -- ^ A human-readable description of the collateral leg.
+  where
+    signatory seller
+    observer buyer
+
+    choice Accept : ContractId CollateralLeg
+      -- ^ The `buyer` accepts the proposal, creating a firm `CollateralLeg` agreement.
+      controller buyer
+      do
+        create CollateralLeg with
+          seller
+          buyer
+          collateralAccount
+          repoAgreementCid
+          description
+
+    choice Decline : ()
+      -- ^ Either party can decline the proposal, archiving it without creating an agreement.
+      controller seller, buyer
+      do
+        pure ()
+
+-- | A bilateral agreement representing the collateral leg of a repo transaction.
+-- This contract signifies the `seller`'s obligation to deliver the specified collateral
+-- to the `buyer`. The settlement is executed via the `Settle` choice.
+template CollateralLeg
+  with
+    seller : Party
+      -- ^ The party delivering the collateral (borrower).
+    buyer : Party
+      -- ^ The party receiving the collateral (lender).
+    collateralAccount : F.V
+      -- ^ The fungible token account view specifying the collateral to be transferred.
+    repoAgreementCid : ContractId RepoAgreement
+      -- ^ A reference to the parent repo agreement.
+    description : Text
+      -- ^ A human-readable description of the collateral leg.
+  where
+    signatory seller, buyer
+
+    key (seller, buyer, repoAgreementCid) : (Party, Party, ContractId RepoAgreement)
+    maintainer key._1, key._2
+
+    choice Settle : ContractId F.I
+      -- ^ The `seller` initiates the settlement of this leg by transferring the collateral.
+      -- This choice is designed to be called as part of a larger atomic transaction,
+      -- typically orchestrated by the parent `RepoAgreement` to ensure DvP with the cash leg.
+      -- It returns the ContractId of the buyer's new fungible token holding.
+      controller seller
+      do
+        -- Fetch the seller's fungible token contract.
+        fungibleCid <- fetch collateralAccount.id.cid
+
+        -- Split the required amount from the seller's main account.
+        -- This archives the original contract and creates new contracts for the
+        -- split amounts and the remainder.
+        splitResult <- exercise fungibleCid F.Split with
+          amounts = [collateralAccount.amount.quantity]
+
+        -- The `split` field of the result contains a list of contracts, one for
+        -- each amount requested. We requested one amount, so we expect one contract.
+        -- Using pattern matching here ensures the transaction fails if the list
+        -- does not contain exactly one element.
+        let [collateralToTransferCid] = splitResult.split
+
+        -- Transfer the newly created, perfectly-sized collateral contract to the buyer.
+        -- This archives the split-off contract and creates a new one owned by the buyer.
+        [newFungibleCid] <- exercise collateralToTransferCid F.Transfer with
+          newOwners = singleton buyer
+
+        return newFungibleCid
