@@ -1,0 +1,58 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Repo.CashLeg where
+
+import Daml.Finance.Interface.Types.Common.Types (Account, InstrumentKey)
+import Daml.Finance.Interface.Asset.Allocation qualified as Allocation (I, createFromDebit)
+import DA.Set (singleton, Set)
+import DA.Map (Map)
+
+-- | Represents the cash leg of a repo transaction.
+-- This contract is created by the `buyer` (lender) and signifies their
+-- commitment to provide the purchase price to the `seller` (borrower).
+-- Its primary purpose is to be consumed to create an `Allocation` contract,
+-- which is a standard Daml Finance primitive used for atomic settlement (DvP).
+template CashLeg
+  with
+    repoId         : Text          -- ^ Unique identifier for the repo transaction.
+    buyer          : Party         -- ^ The party providing the cash (lender).
+    seller         : Party         -- ^ The party receiving the cash (borrower).
+    buyerAccount   : Account       -- ^ The buyer's cash account, from which funds will be debited.
+    sellerAccount  : Account       -- ^ The seller's cash account, to which funds will be credited.
+    cashInstrument : InstrumentKey -- ^ The instrument key for the cash asset (e.g., Canton Cash).
+    purchasePrice  : Decimal       -- ^ The amount of cash to be transferred.
+    observers      : Map Party ()  -- ^ Additional observers.
+  where
+    signatory buyer
+    observer seller, buyerAccount.provider, sellerAccount.provider
+
+    key (buyer, seller, repoId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | Creates the cash `Allocation` required for DvP settlement.
+    -- The buyer authorizes the creation of a claim against their account for the
+    -- purchase price. This allocation can then be used in a settlement instruction.
+    -- The resulting `Allocation` is "locked" by the buyer, meaning only they can
+    -- approve its use in a settlement instruction, preventing the seller from
+    -- claiming the cash without fulfilling the collateral leg.
+    choice Create_Cash_Allocation : ContractId Allocation.I
+      controller buyer
+      do
+        -- Ensure the parties on this leg own their respective accounts.
+        assertMsg "Buyer must be the owner of the source cash account."
+          (buyer == buyerAccount.owner)
+
+        assertMsg "Seller must be the owner of the destination cash account."
+          (seller == sellerAccount.owner)
+
+        -- Use the standard Daml Finance helper to create an allocation from a
+        -- debit perspective. This creates a claim against the buyer's account.
+        -- The allocation itself specifies the seller's account as the destination
+        -- for the eventual credit.
+        Allocation.createFromDebit
+          buyerAccount
+          cashInstrument
+          sellerAccount
+          purchasePrice
+          (singleton buyer) -- Lockers: only the buyer can approve use of this allocation.
