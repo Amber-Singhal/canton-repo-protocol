@@ -1,0 +1,164 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Repo.Rollover where
+
+import Daml.Script
+import DA.Assert
+import DA.Date
+import DA.Time
+
+import Repo.RepoAgreement (RepoAgreement)
+
+-- | Represents a proposal to roll over an existing `RepoAgreement`.
+--
+-- This contract is created by one party (the `proposer`) and sent to the
+-- `counterparty`. The actual rollover is executed via a choice on the target
+-- `RepoAgreement` template, which consumes this proposal to ensure atomicity and
+-- that the terms agreed here are the ones enacted.
+template RolloverProposal
+  with
+    proposer: Party
+      -- ^ The party proposing the rollover.
+    counterparty: Party
+      -- ^ The party who must accept the proposal.
+    repoAgreementCid: ContractId RepoAgreement
+      -- ^ The `ContractId` of the repo agreement to be rolled over.
+    originalAgreement: RepoAgreement
+      -- ^ The full data of the original agreement, to prevent changes between
+      -- proposal and acceptance.
+    newTerminationDate: Date
+      -- ^ The proposed new termination date for the repo.
+    newRate: Decimal
+      -- ^ The proposed new repo rate for the extended term.
+    createdAt: Time
+      -- ^ The timestamp when the proposal was created.
+  where
+    signatory proposer
+    observer counterparty
+
+    let
+      dayCount = daysInTerm originalAgreement.terminationDate newTerminationDate
+      newPurchasePrice = originalAgreement.terminationPrice
+      newTerminationPrice = calculateTerminationPrice newPurchasePrice newRate dayCount
+
+    ensure
+      newTerminationDate > originalAgreement.terminationDate &&
+      "New termination date must be after the original termination date."
+
+    key (proposer, counterparty, repoAgreementCid) : (Party, Party, ContractId RepoAgreement)
+    maintainer key._1
+
+    -- | Allows the proposer to withdraw the rollover proposal before it's accepted.
+    nonconsuming choice Withdraw : ()
+      controller proposer
+      do
+        create_ WithdrawRolloverEvent with ..
+
+    -- | Allows the counterparty to formally decline the rollover proposal.
+    nonconsuming choice Decline : ()
+      controller counterparty
+      do
+        create_ DeclineRolloverEvent with ..
+
+-- | Archivable event signaling the withdrawal of a rollover proposal.
+template WithdrawRolloverEvent
+  with
+    proposer: Party
+    counterparty: Party
+    repoAgreementCid: ContractId RepoAgreement
+    newTerminationDate: Date
+    newRate: Decimal
+    createdAt: Time
+  where
+    signatory proposer
+    observer counterparty
+
+-- | Archivable event signaling the decline of a rollover proposal.
+template DeclineRolloverEvent
+  with
+    proposer: Party
+    counterparty: Party
+    repoAgreementCid: ContractId RepoAgreement
+    newTerminationDate: Date
+    newRate: Decimal
+    createdAt: Time
+  where
+    signatory counterparty
+    observer proposer
+
+-- | Helper function to calculate the number of days between two dates.
+-- This is a simple day count; a production system might use a more complex
+-- day count convention (e.g., ACT/360, 30/360).
+daysInTerm : Date -> Date -> Int
+daysInTerm startDate endDate = daysSinceEpoch endDate - daysSinceEpoch startDate
+
+-- | Helper function to calculate the termination price based on the purchase price,
+-- rate, and term length. Assumes an ACT/360 day count convention.
+calculateTerminationPrice : Decimal -> Decimal -> Int -> Decimal
+calculateTerminationPrice purchasePrice rate dayCount =
+  purchasePrice * (1.0 + rate * (intToDecimal dayCount / 360.0))
+
+-- | Test script to demonstrate the creation and lifecycle of a RolloverProposal.
+testRolloverProposal : Script ()
+testRolloverProposal = script do
+  cashProvider <- allocatePartyWithHint "CashProvider" (PartyIdHint "cashprovider")
+  collateralProvider <- allocatePartyWithHint "CollateralProvider" (PartyIdHint "collateralprovider")
+
+  now <- getTime
+  let
+    today = toDateUTC now
+    originalTermination = addDays today 30
+    newTermination = addDays originalTermination 30
+
+  -- This is a placeholder for a real RepoAgreement contract that would exist on the ledger.
+  -- In a real test, you would create this first and get its contract ID.
+  let
+    dummyAgreement = RepoAgreement with
+      cashProvider = cashProvider
+      collateralProvider = collateralProvider
+      tradeId = "TESTREPO_ROLL_001"
+      purchaseDate = today
+      terminationDate = originalTermination
+      purchasePrice = 1_000_000.0
+      terminationPrice = 1_004_166.6667 -- Based on a 5% rate for 30 days
+      rate = 0.05
+      collateral = []
+      cash = []
+      createdAt = now
+    -- A placeholder ContractId is needed because we aren't creating the actual
+    -- RepoAgreement in this script.
+    dummyRepoCid: ContractId RepoAgreement = unsafeContractId "00deadbeef00deadbeef00deadbeef00deadbeef00deadbeef00deadbeef00deadbeef00"
+
+  -- 1. Proposer creates a rollover proposal.
+  proposalCid <- submit cashProvider do
+    createCmd RolloverProposal with
+      proposer = cashProvider
+      counterparty = collateralProvider
+      repoAgreementCid = dummyRepoCid
+      originalAgreement = dummyAgreement
+      newTerminationDate = newTermination
+      newRate = 0.055
+      createdAt = now
+
+  -- 2. Counterparty reviews the proposal and declines it.
+  submit collateralProvider do
+    exerciseCmd proposalCid Decline
+
+  -- 3. Proposer creates another proposal.
+  proposalCid2 <- submit cashProvider do
+    createCmd RolloverProposal with
+      proposer = cashProvider
+      counterparty = collateralProvider
+      repoAgreementCid = dummyRepoCid
+      originalAgreement = dummyAgreement
+      newTerminationDate = addDays originalTermination 60 -- Different terms
+      newRate = 0.0525
+      createdAt = now
+
+  -- 4. Proposer withdraws the second proposal.
+  submit cashProvider do
+    exerciseCmd proposalCid2 Withdraw
+
+  debug "Rollover proposal lifecycle tests completed successfully."
+  return ()
