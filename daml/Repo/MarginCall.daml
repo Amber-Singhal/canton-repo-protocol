@@ -1,0 +1,124 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Repo.MarginCall where
+
+import DA.Assert (assertMsg)
+import DA.Next.Map (Map)
+import DA.Optional (fromSomeNote)
+import DA.Time (Time)
+import DA.Traversable (forA)
+import qualified DA.Next.Map as Map
+
+import Daml.Finance.Interface.Types.Common.Types (Id)
+import Daml.Finance.Interface.Asset.Fungible qualified as Fungible (I, View(..))
+import Daml.Finance.Interface.Asset.NonFungible qualified as NonFungible (I, View(..))
+import Daml.Finance.Interface.Settlement.Allocation qualified as Allocation (I, View(..), ClaimResult(..), GetDisclosure)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, flatten)
+
+import Repo.RepoAgreement (RepoAgreement(..))
+import Repo.CollateralLeg (Collateral(..))
+
+-- | Represents a formal request for additional margin from the borrower.
+-- This contract is created by the lender when the collateral value drops below the
+-- agreed maintenance margin threshold. It locks the state of the `RepoAgreement`
+-- until the margin call is either satisfied or cancelled, ensuring that no other
+-- actions can be taken on the repo during the margin call process.
+template MarginCallRequest
+  with
+    lender: Party
+      -- ^ The party demanding additional margin (the cash provider in the repo).
+    borrower: Party
+      -- ^ The party required to post additional margin (the collateral provider).
+    operator: Party
+      -- ^ An operator party, responsible for orchestration or observation.
+    repo: RepoAgreement
+      -- ^ The full state of the repo agreement at the time of the margin call.
+    shortfallAmount: Decimal
+      -- ^ The calculated value of the margin deficit that needs to be covered.
+    currentCollateralValue: Decimal
+      -- ^ The market value of the collateral at the time of the call.
+    dueDate: Time
+      -- ^ The deadline by which the margin must be posted.
+    marginCallId: Text
+      -- ^ A unique identifier for this margin call request.
+  where
+    signatory lender
+    observer borrower, operator
+
+    key (lender, borrower, repo.repoId, marginCallId) : (Party, Party, Text, Text)
+    maintainer key._1
+
+    -- | Allows the lender to withdraw the margin call request.
+    -- This would typically happen if the collateral value recovers, if the call was
+    -- made in error, or by mutual agreement. It archives the margin call and
+    -- recreates the original `RepoAgreement`, effectively unlocking it.
+    choice Cancel : ContractId RepoAgreement
+      controller lender
+      do
+        create repo
+
+    -- | Allows the borrower to satisfy the margin call by posting additional assets.
+    -- The borrower provides a CIP-0056 `Allocation` contract containing the assets
+    -- (cash or securities) to be used as margin. The choice atomically:
+    -- 1. Verifies the value of the allocated assets against the shortfall.
+    -- 2. Claims the assets for the lender.
+    -- 3. Updates the collateral position by creating a new `Collateral` contract.
+    -- 4. Recreates the `RepoAgreement` with the new state.
+    choice PostMargin : ContractId RepoAgreement
+      with
+        allocationCid: ContractId Allocation.I
+          -- ^ A CIP-0056 Allocation contract containing the assets to be posted as margin.
+        valuations: Map Id Decimal
+          -- ^ A map of asset IDs to their agreed-upon market prices for valuation.
+          -- This ensures both parties agree on the value of posted margin.
+      controller borrower
+      do
+        -- Step 1: Fetch and validate the allocation contract.
+        allocView <- exercise allocationCid Allocation.GetView
+        assertMsg "Allocation must be from the borrower to the lender" $
+          allocView.settlor == borrower && allocView.beneficiary == lender
+
+        -- Step 2: Get the asset CIDs from the allocation via the disclosure mechanism.
+        disclosureCid <- exercise allocView.disclosure Allocation.GetDisclosure
+        flattenedAssets <- exercise disclosureCid Disclosure.flatten
+
+        -- Step 3: Calculate the total value of the assets in the allocation.
+        fungibleValues <- forA flattenedAssets.fungibles \cid -> do
+            v <- exercise cid Fungible.GetView
+            let price = fromSomeNote ("Price not found for fungible asset: " <> show v.id) $ Map.lookup v.id valuations
+            return $ v.amount * price
+
+        nonFungibleValues <- forA flattenedAssets.nonFungibles \cid -> do
+            v <- exercise cid NonFungible.GetView
+            let price = fromSomeNote ("Price not found for non-fungible asset: " <> show v.id) $ Map.lookup v.id valuations
+            return price -- Assuming quantity of 1 for non-fungibles
+
+        let totalPostedValue = sum fungibleValues + sum nonFungibleValues
+
+        assertMsg ("Posted margin value " <> show totalPostedValue <> " is insufficient to cover shortfall " <> show shortfallAmount) $
+          totalPostedValue >= shortfallAmount
+
+        -- Step 4: Claim the assets from the allocation. This atomically transfers
+        -- ownership of all assets from the borrower to the lender.
+        Allocation.ClaimResult{fungibles; nonFungibles} <- exercise allocationCid Allocation.Claim ()
+
+        -- Step 5: Update the repo's collateral position.
+        -- Fetch the original collateral contract.
+        originalCollateral <- fetch repo.collateralCid
+
+        -- Create a new Collateral contract that includes both the original and new assets.
+        let
+          newCollateralFungibles = originalCollateral.fungibleAssets ++ fungibles
+          newCollateralNonFungibles = originalCollateral.nonFungibleAssets ++ nonFungibles
+
+        newCollateralCid <- create Collateral with
+          owner = originalCollateral.owner
+          provider = originalCollateral.provider
+          fungibleAssets = newCollateralFungibles
+          nonFungibleAssets = newCollateralNonFungibles
+          repoId = originalCollateral.repoId
+
+        -- Step 6: Recreate the RepoAgreement with the updated collateral reference.
+        -- This archives the MarginCallRequest and concludes the margin call process.
+        create repo with collateralCid = newCollateralCid
