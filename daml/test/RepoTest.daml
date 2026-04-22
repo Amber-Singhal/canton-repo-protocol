@@ -1,0 +1,262 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module RepoTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as D
+import DA.Time as T
+import DA.Optional (fromSome)
+
+import Repo.RepoAgreement
+import Repo.CollateralLeg
+import Repo.CashLeg
+import Repo.Rollover
+import Repo.MarginCall
+
+-- === Main Test Runner ===
+
+runRepoTests: Script ()
+runRepoTests = script do
+  debug "--- Running Repo Protocol Test Suite ---"
+  testFullLifecycle
+  testRolloverScenario
+  testMarginCallScenario
+  testDefaultScenario
+  debug "--- Repo Protocol Test Suite Finished Successfully ---"
+
+-- === Test Implementations ===
+
+-- Test the happy path: Propose -> Accept -> Close
+testFullLifecycle: Script ()
+testFullLifecycle = script do
+  debug "Running test: testFullLifecycle"
+
+  -- 1. Setup parties and common parameters
+  lender <- allocatePartyWithHint "Lender" (PartyIdHint "lender")
+  borrower <- allocatePartyWithHint "Borrower" (PartyIdHint "borrower")
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+
+  let
+    today = D.date 2024 D.Jan 1
+    maturity = D.addDays today 30
+    repoData = RepoData with
+      repoId = "REPO-LFC-001"
+      lender
+      borrower
+      collateral = AssetItem with
+        assetId = "ISIN:US912828U435" -- Example: US T-Bill
+        quantity = 1000000.0
+        unitPrice = 99.8
+      cashAmount = 99_000_000.0
+      haircut = 0.01 -- 1%
+      rate = 0.0525 -- 5.25%
+      dayCountConvention = "ACT/360"
+      startDate = today
+      maturityDate = maturity
+      observers = [operator]
+
+  -- 2. Borrower proposes the repo
+  proposalCid <- submit borrower do
+    createCmd RepoProposal with ..repoData
+
+  -- 3. Lender accepts the repo, triggering atomic DvP settlement
+  (agreementCid, (collateralCid, cashCid)) <- submit lender do
+    exerciseCmd proposalCid RepoProposal_Accept
+
+  -- 4. Verify initial state after DvP
+  agreement <- fromSome <$> queryContractId lender agreementCid
+  agreement.repoData === repoData
+
+  collateralLeg <- fromSome <$> queryContractId lender collateralCid
+  collateralLeg.owner === lender
+  collateralLeg.pledgedTo === borrower
+  collateralLeg.asset.assetId === repoData.collateral.assetId
+  collateralLeg.repoAgreementCid === agreementCid
+
+  cashLeg <- fromSome <$> queryContractId borrower cashCid
+  cashLeg.owner === borrower
+  cashLeg.issuer === lender
+  cashLeg.amount === repoData.cashAmount
+  cashLeg.repoAgreementCid === agreementCid
+
+  debug "Repo agreement created and initial settlement complete."
+
+  -- 5. Time passes, borrower initiates closing
+  closingProposalCid <- submit borrower do
+    exerciseCmd agreementCid RepoAgreement_InitiateClose
+
+  -- 6. Lender accepts closing, returning collateral and receiving cash (final DvP)
+  submit lender do
+    exerciseCmd closingProposalCid RepoClosingProposal_Accept
+
+  -- 7. Verify final state (all contracts related to the deal should be archived)
+  queryContractId lender agreementCid >>= \c -> assert (c == None)
+  queryContractId lender collateralCid >>= \c -> assert (c == None)
+  queryContractId borrower cashCid >>= \c -> assert (c == None)
+  queryContractId lender closingProposalCid >>= \c -> assert (c == None)
+
+  debug "SUCCESS: testFullLifecycle"
+  return ()
+
+-- Test the rollover workflow to extend a repo's term
+testRolloverScenario: Script ()
+testRolloverScenario = script do
+  debug "Running test: testRolloverScenario"
+
+  -- 1. Setup an active repo agreement
+  lender <- allocatePartyWithHint "RolloverLender" (PartyIdHint "rollover_lender")
+  borrower <- allocatePartyWithHint "RolloverBorrower" (PartyIdHint "rollover_borrower")
+
+  let
+    today = D.date 2024 Feb 1
+    maturity = D.addDays today 15
+    repoData = RepoData with
+      repoId = "REPO-RO-002"
+      lender
+      borrower
+      collateral = AssetItem with assetId = "ISIN:DE0001102333", quantity = 500000.0, unitPrice = 101.2
+      cashAmount = 50_000_000.0
+      haircut = 0.015
+      rate = 0.0510
+      dayCountConvention = "ACT/360"
+      startDate = today
+      maturityDate = maturity
+      observers = []
+
+  proposalCid <- submit borrower do createCmd RepoProposal with ..repoData
+  (agreementCid, _) <- submit lender do exerciseCmd proposalCid RepoProposal_Accept
+
+  -- 2. Borrower proposes a rollover with new terms
+  let
+    newMaturityDate = D.addDays maturity 30
+    newRate = 0.0515
+  rolloverProposalCid <- submit borrower do
+    exerciseCmd agreementCid RepoAgreement_ProposeRollover with newMaturityDate, newRate
+
+  -- 3. Lender accepts the rollover
+  updatedAgreementCid <- submit lender do
+    exerciseCmd rolloverProposalCid RolloverProposal_Accept
+
+  -- 4. Verify the agreement has been updated with the new terms
+  updatedAgreement <- fromSome <$> queryContractId lender updatedAgreementCid
+  updatedAgreement.repoData.maturityDate === newMaturityDate
+  updatedAgreement.repoData.rate === newRate
+  updatedAgreement.repoData.repoId === repoData.repoId -- ID remains the same
+
+  -- Verify the original agreement and proposal are archived
+  queryContractId lender agreementCid >>= \c -> assert (c == None)
+  queryContractId lender rolloverProposalCid >>= \c -> assert (c == None)
+
+  debug "SUCCESS: testRolloverScenario"
+  return ()
+
+-- Test margin call workflow due to collateral price change
+testMarginCallScenario: Script ()
+testMarginCallScenario = script do
+  debug "Running test: testMarginCallScenario"
+
+  -- 1. Setup an active repo agreement
+  lender <- allocatePartyWithHint "MarginLender" (PartyIdHint "margin_lender")
+  borrower <- allocatePartyWithHint "MarginBorrower" (PartyIdHint "margin_borrower")
+
+  let
+    repoData = RepoData with
+      repoId = "REPO-MC-003"
+      lender
+      borrower
+      collateral = AssetItem with assetId = "ISIN:GB00B15J3910", quantity = 2000000.0, unitPrice = 50.0
+      cashAmount = 98_000_000.0 -- (2m * 50) * (1 - 0.02) = 100m * 0.98
+      haircut = 0.02
+      rate = 0.0500
+      dayCountConvention = "ACT/360"
+      startDate = D.date 2024 Mar 1
+      maturityDate = D.date 2024 Mar 31
+      observers = []
+
+  proposalCid <- submit borrower do createCmd RepoProposal with ..repoData
+  (agreementCid, _) <- submit lender do exerciseCmd proposalCid RepoProposal_Accept
+  initialAgreement <- fromSome <$> queryContractId lender agreementCid
+
+  -- 2. Simulate collateral price drop, Lender initiates margin call
+  let
+    newCollateralPrice = 49.5 -- Price drops, collateral value decreases
+    currentCollateralValue = initialAgreement.repoData.collateral.quantity * newCollateralPrice -- 99,000,000
+    requiredCollateralValue = initialAgreement.repoData.cashAmount / (1.0 - initialAgreement.repoData.haircut) -- 98m / 0.98 = 100,000,000
+    collateralShortfallValue = requiredCollateralValue - currentCollateralValue -- 1,000,000
+    additionalCollateralQty = collateralShortfallValue / newCollateralPrice
+    marginAmount = AssetItem with assetId = repoData.collateral.assetId, quantity = 20202.03, unitPrice = newCollateralPrice
+
+  marginCallProposalCid <- submit lender do
+    exerciseCmd agreementCid RepoAgreement_InitiateMarginCall with
+      newValuation = newCollateralPrice
+      marginAsset = marginAmount
+
+  -- 3. Borrower accepts and posts the required margin collateral
+  updatedAgreementCid <- submit borrower do
+    exerciseCmd marginCallProposalCid MarginCallProposal_Accept
+
+  -- 4. Verify collateral quantity has increased in the agreement
+  updatedAgreement <- fromSome <$> queryContractId lender updatedAgreementCid
+  let
+    expectedNewQuantity = initialAgreement.repoData.collateral.quantity + marginAmount.quantity
+  updatedAgreement.repoData.collateral.quantity === expectedNewQuantity
+
+  debug "SUCCESS: testMarginCallScenario"
+  return ()
+
+-- Test default scenario where borrower fails to close at maturity
+testDefaultScenario: Script ()
+testDefaultScenario = script do
+  debug "Running test: testDefaultScenario"
+
+  -- 1. Setup an active repo agreement
+  lender <- allocatePartyWithHint "DefaultLender" (PartyIdHint "default_lender")
+  borrower <- allocatePartyWithHint "DefaultBorrower" (PartyIdHint "default_borrower")
+
+  let
+    repoData = RepoData with
+      repoId = "REPO-DEF-004"
+      lender
+      borrower
+      collateral = AssetItem with assetId = "ISIN:JP3852200008", quantity = 10000.0, unitPrice = 10000.0
+      cashAmount = 99_000_000.0
+      haircut = 0.01
+      rate = 0.0500
+      dayCountConvention = "ACT/360"
+      startDate = D.date 2024 Apr 1
+      maturityDate = D.date 2024 Apr 2
+      observers = []
+
+  proposalCid <- submit borrower do createCmd RepoProposal with ..repoData
+  (agreementCid, (collateralLegCid, cashLegCid)) <- submit lender do exerciseCmd proposalCid RepoProposal_Accept
+
+  -- 2. Simulate passing the maturity date.
+  -- In Daml Script, time is abstract. We call the choice assuming the ledger time
+  -- is now past the maturity date, which the choice logic should `ensure`.
+  -- We also expect the lender is not allowed to initiate a normal close.
+  submitMustFail lender do
+    exerciseCmd agreementCid RepoAgreement_InitiateClose
+
+  -- 3. Lender declares default, seizing the collateral
+  -- This should archive the agreement and transfer full ownership of the collateral to the lender.
+  seizedCollateralCid <- submit lender do
+    exerciseCmd agreementCid RepoAgreement_DeclareDefault
+
+  -- 4. Verify outcome
+  -- RepoAgreement and its legs should be archived.
+  queryContractId lender agreementCid >>= \c -> assert (c == None)
+  queryContractId lender collateralLegCid >>= \c -> assert (c == None)
+  queryContractId borrower cashLegCid >>= \c -> assert (c == None)
+
+  -- A new, unencumbered collateral receipt should exist for the lender.
+  -- (Assuming `DeclareDefault` returns a `ContractId CollateralHolding` or similar).
+  seizedCollateral <- fromSome <$> queryContractId lender seizedCollateralCid
+  seizedCollateral.owner === lender
+  seizedCollateral.asset.assetId === repoData.collateral.assetId
+  -- We can't easily check for the absence of a field, but by querying a new template
+  -- type like `CollateralHolding`, we confirm it's no longer a `CollateralLeg` with pledges.
+
+  debug "SUCCESS: testDefaultScenario"
+  return ()
