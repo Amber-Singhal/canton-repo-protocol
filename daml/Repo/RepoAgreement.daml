@@ -3,95 +3,179 @@
 
 module Repo.RepoAgreement where
 
-import Daml.Script
-import DA.Date as Date
-import DA.Time as Time
-import DA.Math (intToDecimal)
-import Repo.Settlement (BilateralSettlement(..)) -- Assumes settlement logic is in another module
+import Daml.Finance.Interface.Types.Common.Types (Id)
+import DA.Date (Date)
+import DA.Set (toList)
+import DA.Optional (isSome, fromSome)
+import DA.Assert
 
--- | Defines the collateral asset involved in the repo transaction.
--- Typically identified by a standard identifier like ISIN or CUSIP.
-data Collateral = Collateral
-  with
-    identifier : Text
-    quantity : Decimal
-  deriving (Eq, Show)
+import Repo.CollateralLeg (CollateralLeg(..))
+import Repo.CashLeg (CashLeg(..))
+import Repo.Rollover (RolloverProposal(..))
+import Repo.MarginCall (MarginCallRequest(..))
 
--- | Represents the bilateral agreement for a repurchase transaction after Leg 1 (purchase)
--- has completed and before Leg 2 (repurchase) is due.
--- This contract captures the terms agreed upon by both parties and serves as the
--- master record for the in-flight repo. The settlement of the repurchase leg is
--- handled by exercising a choice on the associated `BilateralSettlement` contract.
+-- | Represents the master agreement for a repo transaction, linking the cash and collateral legs.
+-- This updated version includes an optional `triPartyAgent` to facilitate workflows like
+-- collateral substitution, which is a common feature in the repo market.
 template RepoAgreement
   with
-    tradeIdentifier : Text
-      -- ^ A unique identifier for the repo trade, used for tracking and auditing.
-    cashBorrower : Party
-      -- ^ The party who initially sells the collateral for cash (the repo seller).
-      -- This party is obligated to repurchase the collateral at maturity.
-    cashLender : Party
-      -- ^ The party who initially buys the collateral with cash (the repo buyer).
-      -- This party is obligated to sell the collateral back at maturity.
-    principal : Decimal
-      -- ^ The amount of cash exchanged at the start of the repo (Leg 1).
-    repoRate : Decimal
-      -- ^ The annualized interest rate for the repo, e.g., 0.05 for 5%.
-    collateral : Collateral
-      -- ^ The collateral provided by the cash borrower to the cash lender.
-    startDate : Date
-      -- ^ The effective date of the repo agreement (Leg 1 settlement date).
-    maturityDate : Date
-      -- ^ The date on which the repurchase (Leg 2) is due.
-    repurchaseSettlementCid : ContractId BilateralSettlement
-      -- ^ The contract ID of the DvP (Delivery vs. Payment) instruction for the
-      -- repurchase leg. Exercising this instruction atomically settles the repo.
+    id: Id
+    lender: Party
+    borrower: Party
+    -- | The optional agent for tri-party repos. If `None`, the repo is bilateral.
+    triPartyAgent: Optional Party
+    collateralLegId: ContractId CollateralLeg
+    cashLegId: ContractId CashLeg
+    repoRate: Decimal
+    purchaseDate: Date
+    repurchaseDate: Date
   where
-    signatory cashBorrower, cashLender
+    signatory lender, borrower
+    observer toList triPartyAgent
 
-    key (cashBorrower, cashLender, tradeIdentifier) : (Party, Party, Text)
+    key (lender, borrower, id) : (Party, Party, Id)
     maintainer key._1, key._2
 
-    ensure
-      principal > 0.0 &&
-      collateral.quantity > 0.0 &&
-      maturityDate > startDate &&
-      repoRate >= 0.0
+    ensure purchaseDate < repurchaseDate
+      && repoRate >= 0.0
 
-    -- | Calculates the total amount due at maturity, which is the principal plus
-    -- the interest accrued over the term of the repo.
-    -- This implementation uses a simple Actual/365 day count convention.
-    let calculateRepurchaseAmount : Decimal =
-          let
-            daysHeld : Int = Date.daysSinceEpoch maturityDate - Date.daysSinceEpoch startDate
-            yearFraction : Decimal = intToDecimal daysHeld / 365.0
-            interest : Decimal = principal * repoRate * yearFraction
-          in
-            principal + interest
-
-    -- | Allows the cash borrower to view the calculated repurchase amount before settlement.
-    nonconsuming choice GetRepurchaseAmount : Decimal
-      controller cashBorrower, cashLender
-      do return calculateRepurchaseAmount
-
-    -- | Executes the repurchase leg (Leg 2) of the repo transaction.
-    -- The `cashBorrower` initiates this choice on or after the maturity date.
-    -- It triggers the underlying DvP settlement instruction, which atomically
-    -- exchanges the repurchase amount for the collateral. Upon successful settlement,
-    -- this `RepoAgreement` contract is archived.
-    choice SettleRepurchase : ()
-      controller cashBorrower
+    -- | Consuming choice to terminate the repo at maturity. In a full implementation, this
+    -- | would trigger DvP settlement of the cash and collateral legs.
+    choice Terminate : ()
+      controller lender, borrower
       do
-        now <- getTime
-        today <- fst <$> toDateUTC now
-        assertMsg "Repurchase can only be settled on or after the maturity date" (today >= maturityDate)
-
-        -- Exercise the settlement instruction to perform the atomic DvP.
-        -- This is a consuming choice on the BilateralSettlement contract.
-        -- If this exercise fails, the entire transaction is rolled back, and this
-        -- RepoAgreement contract remains active.
-        exercise repurchaseSettlementCid Settle with settlementAmount = calculateRepurchaseAmount
-
-        -- This choice is consuming (returns ()), so successful execution of the above
-        -- `exercise` will result in this RepoAgreement contract being archived in the
-        -- same atomic transaction.
+        -- A production implementation would exercise choices on the cash and collateral legs
+        -- to perform the repurchase (DvP). For this model, we just archive the agreement.
         pure ()
+
+    -- | Non-consuming choice to propose a rollover of the repo to a new maturity date.
+    nonconsuming choice ProposeRollover : ContractId RolloverProposal
+      with
+        proposer: Party
+        newRepurchaseDate: Date
+        newRepoRate: Decimal
+      controller proposer
+      do
+        assertMsg "Proposer must be either the lender or the borrower"
+          (proposer == lender || proposer == borrower)
+        assertMsg "New repurchase date must be after the current one"
+          (newRepurchaseDate > repurchaseDate)
+        let receiver = if proposer == lender then borrower else lender
+        create RolloverProposal with
+          repoAgreementCid = self
+          proposer = proposer
+          receiver = receiver
+          newRepurchaseDate = newRepurchaseDate
+          newRepoRate = newRepoRate
+
+    -- | Non-consuming choice to request a margin call if collateral value changes.
+    nonconsuming choice RequestMarginCall : ContractId MarginCallRequest
+      with
+        requester: Party
+      controller requester
+      do
+        assertMsg "Requester must be either the lender or the borrower"
+          (requester == lender || requester == borrower)
+        let receiver = if requester == lender then borrower else lender
+        create MarginCallRequest with
+          repoAgreementCid = self
+          requester = requester
+          receiver = receiver
+
+    -- | Allows the borrower in a tri-party repo to propose substituting the collateral.
+    -- The borrower must first create the new `CollateralLeg` contract and provide its ID.
+    nonconsuming choice RequestCollateralSubstitution : ContractId CollateralSubstitutionRequest
+      with
+        newCollateralLegCid : ContractId CollateralLeg
+      controller borrower
+      do
+        assertMsg "Collateral substitution is only available in tri-party agreements" $
+          isSome triPartyAgent
+        let agent = fromSome triPartyAgent
+
+        -- Validate that the new collateral leg is correctly structured for this repo.
+        newLeg <- fetch newCollateralLegCid
+        assertMsg "New collateral must designate the repo lender as owner" $
+          newLeg.owner == lender
+        assertMsg "New collateral must designate the repo borrower as custodian" $
+          newLeg.custodian == borrower
+
+        create CollateralSubstitutionRequest with
+          repoAgreementCid = self
+          borrower = borrower
+          lender = lender
+          triPartyAgent = agent
+          newCollateralLegCid = newCollateralLegCid
+
+    -- | Internal choice to execute the atomic substitution of collateral.
+    -- This choice is exercised by the `CollateralSubstitutionPendingLender` proposal upon
+    -- final approval, ensuring all parties (lender, agent) are involved in the state change.
+    choice ExecuteCollateralSubstitution : ContractId RepoAgreement
+      with
+        newCollateralLegCid : ContractId CollateralLeg
+      controller
+        case triPartyAgent of
+          Some agent -> [lender, agent]
+          -- This choice is not available for bilateral repos.
+          None -> []
+      do
+        -- Archive the old collateral leg. The lender (owner) must have rights to do so.
+        -- We assume the CollateralLeg template allows its owner to archive it.
+        exercise collateralLegId Archive
+
+        -- Create the new version of the agreement with the updated collateral leg.
+        -- The current agreement is archived as this is a consuming choice.
+        create this with collateralLegId = newCollateralLegCid
+
+-- | A proposal from the Borrower to the Tri-Party Agent to substitute collateral.
+-- The borrower creates this contract to formally initiate the substitution workflow.
+template CollateralSubstitutionRequest
+  with
+    repoAgreementCid    : ContractId RepoAgreement
+    borrower            : Party
+    lender              : Party
+    triPartyAgent       : Party
+    newCollateralLegCid : ContractId CollateralLeg
+  where
+    signatory borrower, triPartyAgent
+
+    choice RejectByAgent : ()
+      controller triPartyAgent, borrower
+      do
+        -- The borrower can withdraw their request, or the agent can reject it.
+        pure ()
+
+    choice ApproveByAgent : ContractId CollateralSubstitutionPendingLender
+      controller triPartyAgent
+      do
+        -- The agent performs due diligence (e.g., checks collateral eligibility and value).
+        -- Upon approval, the request is forwarded to the lender for final sign-off.
+        create CollateralSubstitutionPendingLender with ..
+
+-- | A substitution request that has been approved by the Tri-Party Agent and is now awaiting
+-- approval from the Lender. This two-step process ensures proper segregation of duties.
+template CollateralSubstitutionPendingLender
+  with
+    repoAgreementCid    : ContractId RepoAgreement
+    borrower            : Party
+    lender              : Party
+    triPartyAgent       : Party
+    newCollateralLegCid : ContractId CollateralLeg
+  where
+    signatory lender, triPartyAgent
+
+    choice RejectByLender : ()
+      controller lender
+      do
+        -- If the lender rejects, the process terminates. The borrower is responsible for
+        -- managing the `newCollateralLegCid` they created (e.g., by archiving it).
+        pure ()
+
+    choice AcceptByLender : ContractId RepoAgreement
+      controller lender
+      do
+        -- On final acceptance, the lender exercises the choice on the master agreement
+        -- to perform the atomic update. This requires the agent's authority as well,
+        -- which is enforced by the controllers on `ExecuteCollateralSubstitution`.
+        exercise repoAgreementCid ExecuteCollateralSubstitution with
+          newCollateralLegCid = newCollateralLegCid
